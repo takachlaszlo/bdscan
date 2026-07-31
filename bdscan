@@ -1,0 +1,356 @@
+#!/usr/bin/env bash
+#
+# bdscan - Select the longest Blu-ray playlist, create a BDInfo report,
+#          summarize it with ffprobe, and optionally print an x264 command.
+#
+# Requires: bash, BDInfoCLI-ng (bdinfo), ffprobe with bluray/libbluray support,
+#           jq, realpath, mktemp
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+export LC_ALL=C
+
+PROGRAM=${0##*/}
+OUTPUT_DIR=${BDSCAN_OUTPUT_DIR:-"$HOME/encode"}
+SHOW_FFMPEG=0
+DISC_PATH=.
+DISC_PATH_SET=0
+
+usage() {
+    cat <<EOF
+Usage: $PROGRAM [OPTIONS] [BLU_RAY_ROOT]
+
+Scans a Blu-ray directory, selects its longest playlist, writes a BDInfo
+report, and prints an ffprobe summary.
+
+Arguments:
+  BLU_RAY_ROOT       Directory containing BDMV (default: current directory)
+
+Options:
+  -o, --output DIR   Report/output directory (default: ~/encode)
+  -f, --ffmpeg       Print a ready-to-edit ffmpeg/libx264 command
+  -h, --help         Show this help
+
+Environment:
+  BDSCAN_OUTPUT_DIR  Alternative default output directory
+
+Examples:
+  bdscan .
+  bdscan -o ~/encode "/path/with spaces/to/disc"
+  bdscan --ffmpeg .
+EOF
+}
+
+die() {
+    trap - ERR
+    printf 'Error: %s\n' "$*" >&2
+    exit 1
+}
+
+note() {
+    printf '%s\n' "$*"
+}
+
+need_command() {
+    command -v "$1" >/dev/null 2>&1 ||
+        die "Required command '$1' was not found. $2"
+}
+
+shell_join() {
+    local arg
+    printf '  '
+    for arg in "$@"; do
+        printf '%q ' "$arg"
+    done
+    printf '\n'
+}
+
+human_bitrate() {
+    local value=${1:-}
+    if [[ $value =~ ^[0-9]+$ ]] && (( value > 0 )); then
+        awk -v b="$value" 'BEGIN {
+            if (b >= 1000000) printf "%.2f Mb/s", b / 1000000;
+            else if (b >= 1000) printf "%.0f kb/s", b / 1000;
+            else printf "%d b/s", b;
+        }'
+    else
+        printf 'not reported'
+    fi
+}
+
+cleanup() {
+    if [[ -n ${TMP_DIR:-} && -d $TMP_DIR ]]; then
+        rm -rf -- "$TMP_DIR"
+    fi
+    return 0
+}
+trap cleanup EXIT
+trap 'die "Unexpected failure on line $LINENO."' ERR
+
+while (( $# > 0 )); do
+    case $1 in
+        -o|--output)
+            (( $# >= 2 )) || die "$1 requires a directory."
+            OUTPUT_DIR=$2
+            shift 2
+            ;;
+        -f|--ffmpeg)
+            SHOW_FFMPEG=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            (( $# <= 1 )) || die "Only one Blu-ray root may be specified."
+            if (( $# == 1 )); then
+                DISC_PATH=$1
+                DISC_PATH_SET=1
+            fi
+            shift $#
+            ;;
+        -*)
+            die "Unknown option: $1 (use --help)"
+            ;;
+        *)
+            (( DISC_PATH_SET == 0 )) ||
+                die "Only one Blu-ray root may be specified."
+            DISC_PATH=$1
+            DISC_PATH_SET=1
+            shift
+            ;;
+    esac
+done
+
+need_command bdinfo "Install BDInfoCLI-ng as /usr/local/bin/bdinfo."
+need_command ffprobe "Install it with: sudo apt install ffmpeg"
+need_command jq "Install it with: sudo apt install jq"
+need_command realpath "Install it with: sudo apt install coreutils"
+need_command mktemp "Install it with: sudo apt install coreutils"
+
+DISC_PATH=$(realpath -e -- "$DISC_PATH") ||
+    die "Blu-ray path does not exist."
+[[ -d $DISC_PATH ]] || die "Blu-ray root must be a directory: $DISC_PATH"
+[[ -d $DISC_PATH/BDMV ]] ||
+    die "No BDMV directory found below: $DISC_PATH"
+[[ -d $DISC_PATH/BDMV/PLAYLIST ]] ||
+    die "No BDMV/PLAYLIST directory found below: $DISC_PATH"
+
+mkdir -p -- "$OUTPUT_DIR" ||
+    die "Could not create output directory: $OUTPUT_DIR"
+OUTPUT_DIR=$(realpath -e -- "$OUTPUT_DIR") ||
+    die "Could not resolve output directory."
+[[ -w $OUTPUT_DIR ]] || die "Output directory is not writable: $OUTPUT_DIR"
+
+if ! ffprobe -v error -protocols 2>/dev/null |
+        awk '$1 == "bluray" { found=1 } END { exit !found }'; then
+    die "This ffprobe build has no bluray/libbluray protocol. Install Debian's ffmpeg package (sudo apt install ffmpeg) or an FFmpeg build with libbluray enabled."
+fi
+
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/bdscan.XXXXXXXX") ||
+    die "Could not create a temporary directory."
+LIST_FILE=$TMP_DIR/playlists.txt
+PROBE_FILE=$TMP_DIR/ffprobe.json
+REPORT_STAMP=$TMP_DIR/report-started
+
+note "Scanning Blu-ray playlists with BDInfo..."
+if ! bdinfo -l "$DISC_PATH" >"$LIST_FILE" 2>&1; then
+    cat "$LIST_FILE" >&2
+    die "BDInfo could not list the playlists."
+fi
+cat "$LIST_FILE"
+
+SELECTED_MPLS=
+SELECTED_DURATION=
+SELECTED_SECONDS=-1
+
+while IFS= read -r line; do
+    if [[ $line =~ ([0-9]{5})\.[Mm][Pp][Ll][Ss][[:space:]]+([0-9]+):([0-9]{2}):([0-9]{2}) ]]; then
+        mpls=${BASH_REMATCH[1]}
+        hours=${BASH_REMATCH[2]}
+        minutes=${BASH_REMATCH[3]}
+        seconds=${BASH_REMATCH[4]}
+        total=$((10#$hours * 3600 + 10#$minutes * 60 + 10#$seconds))
+        if (( total > SELECTED_SECONDS )); then
+            SELECTED_MPLS=$mpls
+            SELECTED_DURATION=$(printf '%02d:%02d:%02d' \
+                "$((10#$hours))" "$((10#$minutes))" "$((10#$seconds))")
+            SELECTED_SECONDS=$total
+        fi
+    fi
+done <"$LIST_FILE"
+
+[[ -n $SELECTED_MPLS ]] ||
+    die "No playlist and duration could be parsed from 'bdinfo -l'."
+
+PLAYLIST_NUMBER=$((10#$SELECTED_MPLS))
+PLAYLIST_FILE=$DISC_PATH/BDMV/PLAYLIST/${SELECTED_MPLS}.mpls
+if [[ ! -f $PLAYLIST_FILE ]]; then
+    PLAYLIST_FILE=$DISC_PATH/BDMV/PLAYLIST/${SELECTED_MPLS}.MPLS
+fi
+[[ -f $PLAYLIST_FILE ]] ||
+    die "Selected playlist file is missing: ${SELECTED_MPLS}.mpls"
+
+note
+note "Selected playlist"
+printf '  MPLS:     %s.MPLS\n' "$SELECTED_MPLS"
+printf '  Duration: %s\n' "$SELECTED_DURATION"
+printf '  Disc:     %s\n' "$DISC_PATH"
+
+touch "$REPORT_STAMP"
+note
+note "Creating BDInfo report in: $OUTPUT_DIR"
+if ! bdinfo -m "${SELECTED_MPLS}.MPLS" "$DISC_PATH" "$OUTPUT_DIR"; then
+    die "BDInfo report generation failed."
+fi
+
+NEW_REPORTS=()
+while IFS= read -r -d '' report; do
+    NEW_REPORTS+=("$report")
+done < <(
+    find "$OUTPUT_DIR" -maxdepth 1 -type f -newer "$REPORT_STAMP" -print0 2>/dev/null
+)
+if (( ${#NEW_REPORTS[@]} > 0 )); then
+    note "New report file(s):"
+    for report in "${NEW_REPORTS[@]}"; do
+        printf '  %s\n' "$report"
+    done
+else
+    note "BDInfo completed; no newly timestamped report file was detected."
+fi
+
+note
+note "Reading playlist streams with ffprobe..."
+if ! ffprobe -v error \
+        -playlist "$PLAYLIST_NUMBER" \
+        -show_streams -show_format \
+        -of json \
+        "bluray:$DISC_PATH" >"$PROBE_FILE"; then
+    die "ffprobe could not read playlist ${SELECTED_MPLS}.MPLS. The disc must be decrypted, and ffprobe must support libbluray."
+fi
+if ! jq -e '.streams | type == "array"' "$PROBE_FILE" >/dev/null; then
+    die "ffprobe returned invalid or incomplete JSON."
+fi
+
+note
+note "Stream summary"
+
+video_count=0
+while IFS=$'\t' read -r index codec profile width height pix_fmt bitrate transfer primaries hdr; do
+    ((video_count += 1))
+    printf '  Video #%s: %s' "$index" "$codec"
+    [[ $profile != "-" ]] && printf ' (%s)' "$profile"
+    [[ $width != "0" && $height != "0" ]] && printf ', %sx%s' "$width" "$height"
+    [[ $pix_fmt != "-" ]] && printf ', %s' "$pix_fmt"
+    printf ', %s' "$(human_bitrate "$bitrate")"
+    printf ', %s' "$hdr"
+    [[ $transfer != "-" ]] && printf ' [transfer=%s' "$transfer"
+    if [[ $transfer != "-" ]]; then
+        [[ $primaries != "-" ]] && printf ', primaries=%s' "$primaries"
+        printf ']'
+    fi
+    printf '\n'
+done < <(
+    jq -r '
+      .streams[]
+      | select(.codec_type == "video")
+      | (if any((.side_data_list // [])[]?;
+                  (((.side_data_type // "") | ascii_downcase | contains("dovi"))
+                   or has("dv_profile")))
+         then "Dolby Vision"
+         elif .color_transfer == "smpte2084" then "HDR (PQ / SMPTE ST 2084)"
+         elif .color_transfer == "arib-std-b67" then "HDR (HLG)"
+         else "SDR or HDR not signaled" end) as $hdr
+      | [
+          (.index // 0),
+          (.codec_name // "unknown"),
+          (.profile // "-"),
+          (.width // 0),
+          (.height // 0),
+          (.pix_fmt // "-"),
+          (.bit_rate // "-"),
+          (.color_transfer // "-"),
+          (.color_primaries // "-"),
+          $hdr
+        ] | @tsv
+    ' "$PROBE_FILE"
+)
+(( video_count > 0 )) || note "  No video stream found."
+
+audio_count=0
+while IFS=$'\t' read -r index language codec profile channels layout bitrate title; do
+    ((audio_count += 1))
+    printf '  Audio #%s: %s, %s' "$index" "$language" "$codec"
+    [[ $profile != "-" ]] && printf ' (%s)' "$profile"
+    if [[ $channels != "0" ]]; then
+        printf ', %s ch' "$channels"
+        [[ $layout != "-" ]] && printf ' (%s)' "$layout"
+    fi
+    printf ', %s' "$(human_bitrate "$bitrate")"
+    [[ $title != "-" ]] && printf ', %s' "$title"
+    printf '\n'
+done < <(
+    jq -r '
+      .streams[]
+      | select(.codec_type == "audio")
+      | [
+          (.index // 0),
+          (.tags.language // "und"),
+          (.codec_name // "unknown"),
+          (.profile // "-"),
+          (.channels // 0),
+          (.channel_layout // "-"),
+          (.bit_rate // "-"),
+          (.tags.title // "-")
+        ] | @tsv
+    ' "$PROBE_FILE"
+)
+(( audio_count > 0 )) || note "  No audio stream found."
+
+subtitle_count=0
+while IFS=$'\t' read -r index language codec title; do
+    ((subtitle_count += 1))
+    printf '  Subtitle #%s: %s, %s' "$index" "$language" "$codec"
+    [[ $title != "-" ]] && printf ', %s' "$title"
+    printf '\n'
+done < <(
+    jq -r '
+      .streams[]
+      | select(.codec_type == "subtitle")
+      | [
+          (.index // 0),
+          (.tags.language // "und"),
+          (.codec_name // "unknown"),
+          (.tags.title // "-")
+        ] | @tsv
+    ' "$PROBE_FILE"
+)
+(( subtitle_count > 0 )) || note "  No subtitle stream found."
+
+FORMAT_BITRATE=$(jq -r '.format.bit_rate // "-"' "$PROBE_FILE")
+note
+printf '  Selected MPLS: %s.MPLS\n' "$SELECTED_MPLS"
+printf '  BDInfo duration: %s\n' "$SELECTED_DURATION"
+printf '  Total input bitrate: %s\n' "$(human_bitrate "$FORMAT_BITRATE")"
+note "  Note: 'und' means ffprobe did not expose a language tag."
+
+if (( SHOW_FFMPEG )); then
+    OUTPUT_FILE=$OUTPUT_DIR/${DISC_PATH##*/}-${SELECTED_MPLS}-x264.mkv
+    note
+    note "Ready-to-edit x264 command"
+    note "Review stream mapping, CRF, audio, and HDR handling before running:"
+    shell_join ffmpeg -hide_banner \
+        -playlist "$PLAYLIST_NUMBER" \
+        -i "bluray:$DISC_PATH" \
+        -map 0:v:0 -map '0:a?' -map '0:s?' \
+        -map_chapters 0 \
+        -c:v libx264 -preset slow -crf 18 \
+        -c:a flac -compression_level 8 \
+        -c:s copy \
+        "$OUTPUT_FILE"
+fi
+
+note
+note "Done."
