@@ -1,32 +1,25 @@
 # bdscan
 
-Kezdőbarát parancssori segédprogram Blu-ray könyvtárak vizsgálatához Debian 12
-alatt. A `bdscan` a
-[BDInfoCLI-ng](https://github.com/Audionut/BDInfoCLI-ng) és az FFmpeghez tartozó
-`ffprobe` programokat fogja össze egyetlen paranccsá.
+Kezdőbarát parancssori segédprogram visszafejtett Blu-ray könyvtárak
+vizsgálatához Debian 12 alatt. A `bdscan` a BDInfoCLI-ng és az FFmpeghez
+tartozó `ffprobe` programokat fogja össze.
 
 A program:
 
-- kilistázza a Blu-ray lejátszási listáit (MPLS fájlok);
-- automatikusan kiválasztja a leghosszabb lejátszási listát;
-- BDInfo riportot készít;
+- kilistázza a Blu-ray lejátszási listáit;
+- automatikusan kiválasztja a leghosszabb MPLS-t;
+- BDInfo-riportot készít;
 - összefoglalja a videó-, hang- és feliratsávokat;
-- megjeleníti a kodeket, felbontást, csatornaszámot, nyelvet és az elérhető
-  bitrátaadatokat;
-- felismeri a PQ és HLG HDR-jelölést, valamint az `ffprobe` által átadott
-  Dolby Vision-információt;
-- kérésre kiír egy biztonságosan idézőjelezett, szerkeszthető FFmpeg/libx264
-  parancsot.
+- felismeri a PQ, HLG és az `ffprobe` által jelzett Dolby Vision adatokat;
+- kérésre kiír egy szerkeszthető FFmpeg/libx264 parancsot;
+- natív batch módban több release-t egymás után elemez.
 
-> [!IMPORTANT]
 > A `bdscan --ffmpeg` csak kiírja a kódolási parancsot. Nem indítja el
-> automatikusan a kódolást. Futtatás előtt mindig ellenőrizd a sávkiosztást,
-> a minőségi beállításokat és HDR-forrás esetén a kívánt HDR/SDR munkafolyamatot.
+> automatikusan a kódolást.
 
-## Mit vár bemenetként?
+## Elvárt könyvtárszerkezet
 
-A bemenet egy már visszafejtett, könyvtárba másolt Blu-ray struktúra legyen.
-A megadott gyökérkönyvtárban legalább ennek kell léteznie:
+Egy release gyökerében legalább ennek kell léteznie:
 
 ```text
 FILM_KONYVTARA/
@@ -36,56 +29,44 @@ FILM_KONYVTARA/
         └── ...
 ```
 
-AACS/BD+ védelemmel ellátott, közvetlenül olvasott lemezt a script nem fejt
-vissza.
+A script nem fejti vissza az AACS/BD+ védelemmel ellátott lemezt.
 
-## Teljes telepítés Debian 12-re
+Batch módban a megadott szülőkönyvtár közvetlen alkönyvtáraiban keres:
 
-Az alábbi lépéseket sorrendben hajtsd végre. A `$HOME` a saját felhasználói
-könyvtáradat jelenti, például `/home/felhasznalo`.
+```text
+RELEASES_ROOT/
+├── Film.One/
+│   └── BDMV/PLAYLIST/
+├── Film.Two/
+│   └── BDMV/PLAYLIST/
+└── Nem.BluRay/
+```
 
-### 1. Alapcsomagok telepítése
+A példában a `Film.One` és `Film.Two` kerül feldolgozásra, a `Nem.BluRay`
+kimarad.
+
+## Telepítés Debian 12-re
+
+### Függőségek
 
 ```bash
 sudo apt update
-sudo apt install -y git wget ca-certificates ffmpeg jq coreutils
+sudo apt install -y git wget ca-certificates ffmpeg jq coreutils findutils
 ```
 
-Ezek szerepe:
-
-- `git`: projektek letöltése GitHubról;
-- `wget` és `ca-certificates`: a Microsoft csomagtár biztonságos letöltése;
-- `ffmpeg`: tartalmazza az elemzéshez használt `ffprobe` programot;
-- `jq`: az `ffprobe` JSON-kimenetének feldolgozása;
-- `coreutils`: többek között a `realpath` és `mktemp` parancsokat biztosítja.
-
-### 2. A .NET 8 SDK telepítése
-
-A BDInfoCLI-ng lefordításához .NET SDK szükséges. Add hozzá a Microsoft
-hivatalos Debian 12 csomagtárát:
+### .NET 8 SDK
 
 ```bash
 cd "$HOME"
-
 wget https://packages.microsoft.com/config/debian/12/packages-microsoft-prod.deb \
   -O packages-microsoft-prod.deb
-
 sudo dpkg -i packages-microsoft-prod.deb
 rm packages-microsoft-prod.deb
-
 sudo apt update
 sudo apt install -y dotnet-sdk-8.0
 ```
 
-Ellenőrzés:
-
-```bash
-dotnet --list-sdks
-```
-
-A kimenetben szerepelnie kell egy `8.0.x` verziónak.
-
-### 3. A BDInfoCLI-ng fordítása és telepítése
+### BDInfoCLI-ng
 
 ```bash
 cd "$HOME"
@@ -100,31 +81,15 @@ dotnet publish bdinfo-cli/bdinfo-cli.csproj \
 sudo install -m 755 publish/bdinfo /usr/local/bin/bdinfo
 ```
 
-> [!WARNING]
-> Ne add hozzá a `--self-contained false` kapcsolót. A projekt egyfájlos,
-> tömörített kiadási beállítása ezzel ütközik, és `NETSDK1176` fordítási hibát
-> okozhat.
+Ne add hozzá a `--self-contained false` kapcsolót, mert a projekt egyfájlos,
+tömörített kiadási beállításával ütközhet.
 
-Ellenőrzés:
-
-```bash
-command -v bdinfo
-bdinfo --version
-```
-
-Az első parancs várható kimenete:
-
-```text
-/usr/local/bin/bdinfo
-```
-
-### 4. A bdscan telepítése
+### bdscan
 
 ```bash
 cd "$HOME"
 git clone https://github.com/takachlaszlo/bdscan.git
 cd bdscan
-
 sudo install -m 755 ./bdscan /usr/local/bin/bdscan
 ```
 
@@ -133,206 +98,139 @@ Ellenőrzés:
 ```bash
 command -v bdscan
 bdscan --help
-echo $?
 ```
-
-A `command -v` várhatóan `/usr/local/bin/bdscan` értéket, az `echo $?` pedig
-`0` értéket ír ki.
-
-### 5. Az FFmpeg Blu-ray támogatásának ellenőrzése
-
-```bash
-ffprobe -v error -protocols | grep -w bluray
-```
-
-Ha a kimenet tartalmazza a `bluray` szót, az FFmpeg megfelelő. Ha nincs
-kimenet, az adott FFmpeg-build nem tartalmaz libbluray támogatást.
 
 ## Használat
 
-### Film vizsgálata teljes útvonallal
-
-Az útvonalat mindig tedd idézőjelek közé. Ez a szóközt tartalmazó neveket is
-biztonságosan kezeli:
+### Egy release elemzése
 
 ```bash
-bdscan "$HOME/storage/Film.Neve.1080p.Blu-ray"
+bdscan "$HOME/torrents/qbittorrent/Film.Neve.1080p.BluRay"
 ```
 
-Helyes:
+Az aktuális könyvtár elemzése:
 
 ```bash
-bdscan "$HOME/storage/Film neve"
-```
-
-Helytelen:
-
-```bash
-bdscan "\$HOME/storage/Film neve"
-```
-
-A helytelen példában a `\` megakadályozza a `$HOME` változó feloldását.
-
-### Vizsgálat a film könyvtárából
-
-```bash
-cd "$HOME/storage/Film.Neve.1080p.Blu-ray"
 bdscan .
 ```
 
-Ha nem adsz meg útvonalat, a script szintén az aktuális könyvtárat használja:
+Útvonal nélkül szintén az aktuális könyvtárat használja:
 
 ```bash
 bdscan
 ```
 
-### Másik riportkönyvtár megadása
+### Natív batch mód
 
-A BDInfo riport alapértelmezésben a `~/encode` könyvtárba kerül. Másik cél:
-
-```bash
-bdscan --output "$HOME/reports" .
-```
-
-Röviden ugyanez:
+A megadott könyvtár minden közvetlen alkönyvtárát feldolgozza, amelyben
+`BDMV/PLAYLIST` található:
 
 ```bash
-bdscan -o "$HOME/reports" .
+bdscan --batch "$HOME/torrents/qbittorrent"
 ```
 
-Az alapértelmezett cél tartósan is felülírható a shell beállításában:
+Rövid kapcsolóval:
 
 ```bash
-export BDSCAN_OUTPUT_DIR="$HOME/reports"
-bdscan .
+bdscan -b "$HOME/torrents/qbittorrent"
 ```
 
-### Szerkeszthető x264 parancs kiírása
+Másik riportkönyvtárral:
+
+```bash
+bdscan --batch \
+  --output "$HOME/encode/bd-reports" \
+  "$HOME/torrents/qbittorrent"
+```
+
+Batch módban:
+
+- minden release ugyanazt az egy-release elemzést kapja;
+- egy hibás release nem állítja le a többit;
+- a végén sikeres/hibás összesítés készül;
+- hibás release esetén a program kilépési kódja `1`;
+- ha minden release sikeres, a kilépési kód `0`.
+
+Ha a `--batch` után megadott könyvtár maga tartalmaz `BDMV/PLAYLIST`
+struktúrát, azt egyetlen release-ként dolgozza fel.
+
+### FFmpeg-parancs kiírása
+
+Egy release-hez:
 
 ```bash
 bdscan --ffmpeg .
 ```
 
-Röviden:
+Batch módban minden sikeresen elemzett release-hez:
 
 ```bash
-bdscan -f .
+bdscan --batch --ffmpeg "$HOME/torrents/qbittorrent"
 ```
 
-## Példa a fontosabb kimenetre
+A parancs csak mintaként kerül kiírásra; futtatás előtt ellenőrizni kell a
+sávkiosztást, a CRF-et, a hangformátumot és a HDR-kezelést.
+
+## Kapcsolók
 
 ```text
-Selected playlist
-  MPLS:     00000.MPLS
-  Duration: 01:51:37
+Usage:
+  bdscan [OPTIONS] [BLU_RAY_ROOT]
+  bdscan --batch [OPTIONS] [RELEASES_ROOT]
 
-Stream summary
-  Video #0: h264 (High), 1920x1080, yuv420p, 28.00 Mb/s
-  Audio #1: eng, pcm_bluray, 6 ch (5.1), 6.91 Mb/s
-  Subtitle #2: eng, hdmv_pgs_subtitle
-```
-
-Az `und` azt jelenti, hogy az `ffprobe` nem adott át nyelvi címkét. A
-`not reported` azt jelenti, hogy az adott bitrátaadat nem volt elérhető.
-
-## Parancssori kapcsolók
-
-```text
-Usage: bdscan [OPTIONS] [BLU_RAY_ROOT]
-
+  -b, --batch        Több Blu-ray release elemzése
   -o, --output DIR   Riportkönyvtár (alapértelmezés: ~/encode)
   -f, --ffmpeg       Szerkeszthető FFmpeg/libx264 parancs kiírása
   -h, --help         Súgó megjelenítése
 ```
 
-## Frissítés
+Az alapértelmezett riportkönyvtár környezeti változóval felülírható:
 
-### bdscan frissítése
+```bash
+export BDSCAN_OUTPUT_DIR="$HOME/encode/bd-reports"
+```
+
+## Frissítés
 
 ```bash
 cd "$HOME/bdscan"
 git pull --ff-only
 sudo install -m 755 ./bdscan /usr/local/bin/bdscan
+bdscan --help
 ```
 
-### BDInfoCLI-ng frissítése
+## Ellenőrzés és gyakori hibák
+
+Az FFmpeg Blu-ray támogatása:
 
 ```bash
-cd "$HOME/BDInfoCLI-ng"
-git pull --ff-only
-
-dotnet publish bdinfo-cli/bdinfo-cli.csproj \
-  -c Release \
-  -r linux-x64 \
-  -o publish
-
-sudo install -m 755 publish/bdinfo /usr/local/bin/bdinfo
+ffprobe -v error -protocols | grep -w bluray
 ```
 
-## Gyakori hibák
-
-### `Required command 'bdinfo' was not found`
-
-A BDInfoCLI-ng nincs telepítve, vagy nem a keresési útvonalon található.
+Ha a `bdinfo` nem található:
 
 ```bash
 command -v bdinfo
 ls -l /usr/local/bin/bdinfo
 ```
 
-Ha egyik sem találja, hajtsd végre újra a BDInfoCLI-ng telepítési lépéseit.
-
-### `dotnet: command not found`
-
-A .NET SDK nincs telepítve. Hajtsd végre a „.NET 8 SDK telepítése” részt, majd
-ellenőrizd:
+Ha a program nem talál BDMV-struktúrát:
 
 ```bash
-dotnet --list-sdks
+find "/utvonal/a/release-hez" -maxdepth 3 -type d \
+  \( -name BDMV -o -name PLAYLIST \) -print
 ```
 
-### `No BDMV directory found`
-
-Nem a Blu-ray gyökérkönyvtárát adtad meg. Ellenőrizd:
-
-```bash
-ls -ld "/utvonal/a/filmhez/BDMV"
-ls -ld "/utvonal/a/filmhez/BDMV/PLAYLIST"
-```
-
-### `This ffprobe build has no bluray/libbluray protocol`
-
-Ellenőrizd és telepítsd újra a Debian FFmpeg-csomagját:
-
-```bash
-sudo apt update
-sudo apt install --reinstall ffmpeg
-ffprobe -v error -protocols | grep -w bluray
-```
-
-### Az `ffprobe` nem tudja olvasni a playlistet
-
-Lehetséges okok:
+Az `ffprobe` olvasási hibájának gyakori okai:
 
 - a Blu-ray még titkosított;
 - hiányos a BDMV-struktúra;
-- hiányzik egy, a playlist által hivatkozott M2TS fájl;
-- nincs olvasási jogosultságod.
-
-Alapvető ellenőrzés:
-
-```bash
-find "/utvonal/a/filmhez/BDMV/PLAYLIST" -maxdepth 1 -type f | head
-find "/utvonal/a/filmhez/BDMV/STREAM" -maxdepth 1 -type f | head
-```
+- hiányzik egy hivatkozott M2TS fájl;
+- nincs megfelelő olvasási jogosultság;
+- az FFmpeg-build nem tartalmaz libbluray támogatást.
 
 ## Eltávolítás
-
-Csak a `bdscan` rendszerparancs eltávolítása:
 
 ```bash
 sudo rm /usr/local/bin/bdscan
 ```
-
-A saját könyvtáradban lévő Git-klón és a korábban elkészített riportok ettől
-nem törlődnek.
